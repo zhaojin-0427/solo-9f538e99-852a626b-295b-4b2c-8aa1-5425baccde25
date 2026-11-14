@@ -278,6 +278,41 @@ tbody tr:hover { background: #fafcfb; }
 .confirm-bar { margin-top: 20px; padding-top: 18px; border-top: 1px solid var(--line); }
 
 .days-list { display: grid; gap: 8px; }
+
+.merge-form {
+  display: flex;
+  align-items: flex-end;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-bottom: 6px;
+}
+.merge-form label {
+  display: grid;
+  gap: 5px;
+  font-size: 13px;
+  color: var(--muted);
+  min-width: 190px;
+}
+.merge-form select {
+  font: inherit;
+  color: var(--ink);
+  background: #fbfcfc;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  padding: 9px 10px;
+  min-width: 190px;
+}
+.merge-form select:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.merge-arrow { color: var(--muted); padding-bottom: 10px; }
+.merge-form .status { padding-bottom: 9px; }
+
+.merge-counts { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+.count-card.old { border-color: #cdd9f8; background: var(--replace-soft); color: var(--replace); }
+.count-card.new { border-color: #c9e6d3; background: var(--add-soft); color: var(--add); }
+.count-card.both { background: var(--ignore-soft); color: var(--ignore); }
+
+.section-title { margin: 22px 0 10px; font-size: 15px; }
+#merge-groups-list { margin-top: 4px; }
 .day-row {
   display: flex;
   align-items: center;

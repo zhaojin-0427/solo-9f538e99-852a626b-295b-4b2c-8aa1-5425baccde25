@@ -15,6 +15,7 @@ CREATE TABLE IF NOT EXISTS published_records (
     value       TEXT    NOT NULL,
     batch_id    TEXT    NOT NULL,
     updated_at  TEXT    NOT NULL,
+    source_station TEXT,
     PRIMARY KEY (date, station, hour)
 );
 
@@ -41,6 +42,34 @@ CREATE TABLE IF NOT EXISTS previews (
 
 CREATE INDEX IF NOT EXISTS idx_previews_date_status
     ON previews (date, status);
+
+-- A station that has been renamed is linked to its current identity.  Both the
+-- retired and the current identifier get a row, so the primary key guarantees
+-- that an identifier can take part in at most one merge.
+CREATE TABLE IF NOT EXISTS station_identities (
+    station           TEXT PRIMARY KEY,
+    canonical_station TEXT NOT NULL,
+    merge_id          TEXT NOT NULL,
+    merged_at         TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_station_identities_canonical
+    ON station_identities (canonical_station);
+
+CREATE TABLE IF NOT EXISTS merge_previews (
+    id            TEXT PRIMARY KEY,
+    old_station   TEXT NOT NULL,
+    new_station   TEXT NOT NULL,
+    status        TEXT NOT NULL,
+    preview_json  TEXT NOT NULL,
+    guard_json    TEXT NOT NULL,
+    result_json   TEXT,
+    created_at    TEXT NOT NULL,
+    updated_at    TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_merge_previews_status
+    ON merge_previews (status);
 """
 
 
@@ -73,5 +102,18 @@ def initialize(db_path: str | Path) -> None:
         connection.execute("PRAGMA journal_mode = WAL")
         connection.execute("PRAGMA synchronous = NORMAL")
         connection.executescript(SCHEMA)
+        _migrate(connection)
     finally:
         connection.close()
+
+
+def _migrate(connection: sqlite3.Connection) -> None:
+    """Apply additive column migrations to databases created by older builds."""
+    columns = {
+        row["name"]
+        for row in connection.execute("PRAGMA table_info(published_records)")
+    }
+    if "source_station" not in columns:
+        connection.execute(
+            "ALTER TABLE published_records ADD COLUMN source_station TEXT"
+        )

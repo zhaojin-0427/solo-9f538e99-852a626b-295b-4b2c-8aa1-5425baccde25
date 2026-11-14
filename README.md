@@ -27,7 +27,10 @@ python3 -m pytest
 ```
 
 测试覆盖：格式错误整批拒绝、批内最高修订号、同修订号冲突、已发布修订号冲突、
-预览跨发布失效、并发确认只有一个成功、重复确认幂等、发布中途失败回滚。
+预览跨发布失效、并发确认只有一个成功、重复确认幂等、发布中途失败回滚；
+站点归并的逐小时取高修订号、同修订号冲突指出时刻并拒绝、原始记录不变、
+原编号来源标注、任一编号补报按合并身份预览与发布、归并与补报使旧预览失效、
+并发归并/确认的一致结果。
 
 ## CSV 格式
 
@@ -64,6 +67,26 @@ SY-002,2026-11-13T00:00:00,3,18.0
   更低修订号 → “忽略（older_than_published）”，不会覆盖既有记录。
 - 新增与替换记录合计为“待发布”；无待发布记录时确认按钮不可用。
 
+## 站点编号归并
+
+监测站更换编号后，可在页面“站点归并”中选择两个**尚未归并**的编号（旧编号 → 现用编号），
+生成归并预览后确认。归并只改变读数时使用的站点身份，**原始已发布记录不改**。
+
+- 归并预览按 `(日期, 小时)` 合并两个编号的读数：**同一小时取较高修订号**。
+- 若同一小时的**最高修订号相同但数值不同**，归并拒绝（`409 merge_conflict`），
+  并在 `detail.conflicts` 中逐条指出日期、时刻、修订号与两个编号各自的数值；此时不建立归并。
+- 每条读数保留来源：`source` 为 `old` / `new` / `both`，`source_station` 为实际写入该记录的
+  原编号。归并后任一编号的补报会物理写入现用编号，但 `source_station` 仍标注提交时使用的编号。
+- 确认归并会为受影响日期递增日版本，使归并前生成的发布预览立即失效；归并预览自身记录
+  生成时相关日期的日版本与行数快照，此后若有补报发布，确认返回 `409 merge_stale`。
+- 归并预览确认幂等：重复确认返回 `200`、`already_merged: true` 并回放首次结果。
+- 并发确认按实际提交顺序串行化：重叠编号的两个归并、同一归并的多个确认，
+  都只有按实际顺序的第一个成功，其余得到 `409` 或幂等结果。
+
+`GET /api/stations` 返回可归并编号与已归并分组；`GET /api/stations/{station}` 返回该身份
+（含旧、新编号）的全部原始读数。`GET /api/merged/{station}/days/{YYYY-MM-DD}` 按现用编号
+返回某日合并读数及每条来源，映射与读数在同一事务快照中读取。
+
 ## 预览与失效
 
 `POST /api/previews` 解析 CSV、按日版本号生成快照并写入预览表（不修改已发布数据）。
@@ -88,6 +111,13 @@ SY-002,2026-11-13T00:00:00,3,18.0
 | `POST` | `/api/previews` | 上传 CSV（`multipart/form-data`，字段 `file`），`201` 返回预览 |
 | `GET` | `/api/previews/{id}` | 读取预览及当前状态 |
 | `POST` | `/api/previews/{id}/confirm` | 确认发布（幂等） |
+| `GET` | `/api/stations` | 可归并站点与已归并分组 |
+| `GET` | `/api/stations/{station}` | 该站点身份（含旧编号）的全部原始读数 |
+| `POST` | `/api/merges` | 生成归并预览，JSON `{"old_station": "...", "new_station": "..."}` |
+| `GET` | `/api/merges/{id}` | 读取归并预览及当前状态 |
+| `POST` | `/api/merges/{id}/confirm` | 确认归并（幂等） |
+| `GET` | `/api/merged/{station}/days/{YYYY-MM-DD}` | 按现用编号读取该日合并读数 |
+| `GET` | `/api/merged/{station}/days/{YYYY-MM-DD}.json` | 同上，附件下载 |
 | `GET` | `/api/days` | 已发布日期列表 |
 | `GET` | `/api/days/{YYYY-MM-DD}` | 该日已发布 JSON |
 | `GET` | `/api/days/{YYYY-MM-DD}.json` | 同上，附件下载 |
@@ -107,3 +137,28 @@ SY-002,2026-11-13T00:00:00,3,18.0
 ```
 
 数值以规范化字符串返回，避免二进制浮点误差；下游按需自行转 `float`/`Decimal`。
+
+合并读数响应（`/api/merged/...`）：
+
+```json
+{
+  "station": "NEW-001",
+  "current_station": "NEW-001",
+  "former_stations": ["OLD-001"],
+  "date": "2026-11-13",
+  "day_version": 2,
+  "count": 3,
+  "records": [
+    {"station": "NEW-001", "hour": "01:00", "timestamp": "2026-11-13T01:00:00",
+     "revision": 2, "value": "11.2", "source_station": "OLD-001", "sources": ["OLD-001"]}
+  ],
+  "conflicts": []
+}
+```
+
+归并预览响应包含 `cells`（每个小时一条，含 `revision`、`value`、`source`、`source_station`、
+`sources`、`conflict`）与 `conflicts`（冲突时刻明细），以及 `counts`：
+
+```json
+{"cells": 3, "from_old": 1, "from_new": 2, "from_both": 0, "conflicts": 0}
+```

@@ -106,6 +106,58 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
     async def confirm(preview_id: str) -> dict:
         return service.confirm_preview(app.state.db_path, preview_id)
 
+    # ---------------- station merges ----------------
+
+    @app.get("/api/stations")
+    async def stations() -> dict:
+        return service.list_stations(app.state.db_path)
+
+    @app.get("/api/stations/{station}")
+    async def station(station: str) -> dict:
+        return service.station_detail(app.state.db_path, station)
+
+    @app.post("/api/merges")
+    async def create_merge(request: Request) -> JSONResponse:
+        try:
+            payload = await request.json()
+        except ValueError:
+            raise service.AppError("请求体必须是 JSON")
+        if not isinstance(payload, dict):
+            raise service.AppError("请求体必须是 JSON 对象")
+        merge = service.create_merge_preview(
+            app.state.db_path,
+            str(payload.get("old_station") or ""),
+            str(payload.get("new_station") or ""),
+        )
+        return JSONResponse(status_code=201, content=merge)
+
+    @app.get("/api/merges/{merge_id}")
+    async def read_merge(merge_id: str) -> dict:
+        return service.get_merge(app.state.db_path, merge_id)
+
+    @app.post("/api/merges/{merge_id}/confirm")
+    async def confirm_merge(merge_id: str) -> dict:
+        return service.confirm_merge(app.state.db_path, merge_id)
+
+    @app.get("/api/merged/{station}/days/{day}.json")
+    async def merged_day_json(station: str, day: str) -> JSONResponse:
+        invalid = _validate_day(day)
+        if invalid is not None:
+            return invalid
+        return JSONResponse(
+            content=service.get_merged_day(app.state.db_path, station, day),
+            headers={
+                "Content-Disposition": f'attachment; filename="{station}-{day}-pm25.json"'
+            },
+        )
+
+    @app.get("/api/merged/{station}/days/{day}")
+    async def merged_day(station: str, day: str) -> dict:
+        invalid = _validate_day(day)
+        if invalid is not None:
+            return invalid
+        return service.get_merged_day(app.state.db_path, station, day)
+
     @app.get("/api/days")
     async def days() -> dict:
         return service.list_days(app.state.db_path)

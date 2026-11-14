@@ -17,6 +17,7 @@
     </div>
     <nav class="nav" aria-label="主导航">
       <a href="#upload" class="nav-link active">上传与预览</a>
+      <a href="#merge" class="nav-link">站点归并</a>
       <a href="#published" class="nav-link">已发布数据</a>
     </nav>
   </header>
@@ -112,6 +113,81 @@
       </div>
     </section>
 
+    <section id="merge" class="panel">
+      <div class="panel-head">
+        <div>
+          <h2>站点编号归并</h2>
+          <p class="hint">监测站更换编号后，把旧、新编号下的 PM2.5 小时记录合并为同一站点。
+            原始已发布记录不改，归并只影响读数时使用的站点身份。</p>
+        </div>
+        <button type="button" id="refresh-stations" class="ghost">刷新站点</button>
+      </div>
+
+      <div class="merge-form">
+        <label>旧编号
+          <select id="merge-old"><option value="">加载中…</option></select>
+        </label>
+        <span class="merge-arrow" aria-hidden="true">→</span>
+        <label>现用编号
+          <select id="merge-new"><option value="">加载中…</option></select>
+        </label>
+        <button type="button" id="merge-preview-btn" class="primary" disabled>生成归并预览</button>
+        <span id="merge-status" class="status" role="status" aria-live="polite"></span>
+      </div>
+      <p class="hint">仅可选择尚未归并的编号。旧、新编号不能相同。</p>
+
+      <div id="merge-conflict" class="alert error" hidden>
+        <div class="alert-head"><strong>同一小时最高修订号数值不一致，归并已拒绝</strong></div>
+        <p>下列时刻在两个编号下修订号相同但数值不同。请先核对并修正源数据，本次不会建立归并。</p>
+        <div id="merge-conflict-list" class="conflict-list"></div>
+      </div>
+
+      <div id="merge-preview" hidden>
+        <div class="panel-head sub">
+          <div>
+            <h3 id="merge-title"></h3>
+            <p class="hint" id="merge-subtitle"></p>
+          </div>
+          <div id="merge-meta" class="meta-chips"></div>
+        </div>
+        <div class="counts merge-counts" id="merge-counts"></div>
+        <div class="table-wrap">
+          <table id="merge-table">
+            <thead>
+              <tr>
+                <th>日期</th>
+                <th>整点时间</th>
+                <th class="num">修订号</th>
+                <th class="num">合并读数</th>
+                <th>来源编号</th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+          <p id="merge-empty" class="empty" hidden>两个编号在所选日期范围内没有可合并的记录。</p>
+        </div>
+        <div class="confirm-bar">
+          <button type="button" id="merge-confirm-btn" class="primary" disabled>确认归并</button>
+          <span id="merge-confirm-status" class="status" role="status" aria-live="polite"></span>
+        </div>
+      </div>
+
+      <div id="merge-stale" class="alert warn" hidden>
+        <div class="alert-head"><strong>归并预览已失效</strong></div>
+        <p>生成预览后，相关日期又被发布或归并。请重新刷新站点并生成新的归并预览。</p>
+      </div>
+
+      <div id="merge-result" class="alert success" hidden>
+        <div class="alert-head"><strong id="merge-result-title">归并成功</strong></div>
+        <p id="merge-result-text"></p>
+      </div>
+
+      <div id="merge-groups">
+        <h3 class="section-title">已归并站点</h3>
+        <div id="merge-groups-list" class="days-list"><p class="empty">正在加载…</p></div>
+      </div>
+    </section>
+
     <section id="published" class="panel">
       <div class="panel-head">
         <div>
@@ -136,11 +212,50 @@
         </div>
         <pre id="day-json" class="json-view"></pre>
       </div>
+
+      <div id="merged-viewer" hidden>
+        <div class="panel-head sub">
+          <div>
+            <h3>按现用编号查看合并读数</h3>
+            <p class="hint">选择一个已归并站点及其日期，查看该日每小时的合并读数与每条读数来自哪个原编号。</p>
+          </div>
+          <div class="day-actions">
+            <a id="merged-download" class="ghost" download hidden>下载合并 JSON</a>
+            <a id="merged-open" class="ghost" target="_blank" rel="noopener" hidden>打开合并 API</a>
+          </div>
+        </div>
+        <div class="merge-form">
+          <label>现用 / 原编号
+            <select id="merged-station"><option value="">加载中…</option></select>
+          </label>
+          <label>日期
+            <select id="merged-date"><option value="">加载中…</option></select>
+          </label>
+          <button type="button" id="merged-load-btn" class="primary" disabled>查看合并读数</button>
+          <span id="merged-status" class="status" role="status" aria-live="polite"></span>
+        </div>
+        <div class="table-wrap">
+          <table id="merged-table">
+            <thead>
+              <tr>
+                <th>整点时间</th>
+                <th class="num">修订号</th>
+                <th class="num">合并读数</th>
+                <th>来源编号</th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+          <p id="merged-empty" class="empty" hidden>该日没有合并读数。</p>
+        </div>
+        <pre id="merged-json" class="json-view"></pre>
+      </div>
+
     </section>
   </main>
 
   <footer class="footer">
-    <span>同站同小时以最高修订号为准 · 同修订号数值不一致则整批拒绝 · 发布为原子事务</span>
+    <span>同站同小时以最高修订号为准 · 同修订号数值不一致则整批拒绝 · 发布为原子事务 · 归并后原始记录不变</span>
   </footer>
 
   <script src="/static/app.js"></script>

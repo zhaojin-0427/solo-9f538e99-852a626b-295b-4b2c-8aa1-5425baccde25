@@ -525,7 +525,9 @@
     link.addEventListener("click", () => {
       document.querySelectorAll(".nav-link").forEach((node) => node.classList.remove("active"));
       link.classList.add("active");
-      if (link.getAttribute("href") === "#published") loadDays();
+      const target = link.getAttribute("href");
+      if (target === "#published") loadDays();
+      if (target === "#merge") loadStations();
     });
   });
 
@@ -555,6 +557,418 @@
     });
   });
 
+  /* ---------------- station merge ---------------- */
+
+  const SOURCE_LABELS = {
+    old: "旧编号",
+    new: "现用编号",
+    both: "两个编号（数值一致）",
+  };
+
+  const mergeState = {
+    stations: null,
+    preview: null,
+    busy: false,
+  };
+
+  function sourceLabel(cell) {
+    const origin = cell.source_station || (cell.stations || []).join("、");
+    if (cell.source === "both") return `${SOURCE_LABELS.both} · ${origin}`;
+    const role = SOURCE_LABELS[cell.source];
+    return role ? `${role} · ${origin}` : origin;
+  }
+
+  function mergePreviewBtnState() {
+    const oldSelect = $("#merge-old");
+    const newSelect = $("#merge-new");
+    const chosen = oldSelect.value && newSelect.value;
+    const same = oldSelect.value && oldSelect.value === newSelect.value;
+    mergePreviewBtn.disabled = mergeState.busy || !chosen || same;
+    return { chosen, same };
+  }
+
+  const mergePreviewBtn = $("#merge-preview-btn");
+
+  function fillStationSelect(select, stations, placeholder) {
+    const previous = select.value;
+    select.innerHTML = "";
+    const blank = document.createElement("option");
+    blank.value = "";
+    blank.textContent = placeholder;
+    select.appendChild(blank);
+    stations.forEach((station) => {
+      const option = document.createElement("option");
+      option.value = station;
+      option.textContent = station;
+      select.appendChild(option);
+    });
+    if (stations.includes(previous)) select.value = previous;
+  }
+
+  async function loadStations() {
+    const status = $("#merge-status");
+    try {
+      const response = await fetch("/api/stations");
+      const data = await readJson(response);
+      if (!response.ok) throw new Error((data && data.message) || "无法读取站点列表");
+      mergeState.stations = data;
+      const names = (data.available || []).map((item) => item.station);
+      fillStationSelect($("#merge-old"), names, "选择旧编号");
+      fillStationSelect($("#merge-new"), names, "选择现用编号");
+      renderMergeGroups(data.merges || []);
+      fillMergedSelects(data.merges || []);
+      if (!names.length) {
+        setStatus(status, "暂时没有可归并的站点，请先发布数据。");
+      } else {
+        setStatus(status, "");
+      }
+    } catch (error) {
+      setStatus(status, `站点列表加载失败：${error.message}`);
+      renderMergeGroups([]);
+    } finally {
+      mergePreviewBtnState();
+    }
+  }
+
+  function renderMergeGroups(merges) {
+    const holder = $("#merge-groups-list");
+    holder.innerHTML = "";
+    if (!merges.length) {
+      const p = document.createElement("p");
+      p.className = "empty";
+      p.textContent = "还没有已归并的站点。";
+      holder.appendChild(p);
+      return;
+    }
+    merges.forEach((group) => {
+      const row = document.createElement("div");
+      row.className = "day-row";
+      const former = group.former_stations.join("、") || "—";
+      row.innerHTML = `
+        <div>
+          <div class="date">${escapeHtml(group.current_station)} <span class="mono">现用编号</span></div>
+          <div class="stats">原编号：${escapeHtml(former)} · 归并时间 ${escapeHtml(
+            new Date(group.merged_at).toLocaleString()
+          )}</div>
+        </div>
+      `;
+      holder.appendChild(row);
+    });
+  }
+
+  function fillMergedSelects(merges) {
+    const select = $("#merged-station");
+    const previous = select.value;
+    select.innerHTML = "";
+    const blank = document.createElement("option");
+    blank.value = "";
+    blank.textContent = merges.length ? "选择站点" : "暂无已归并站点";
+    select.appendChild(blank);
+    merges.forEach((group) => {
+      ["current", ...group.former_stations].forEach((name) => {
+        const option = document.createElement("option");
+        option.value = name;
+        option.textContent =
+          name === group.current_station ? `${name}（现用）` : `${name}（原编号）`;
+        select.appendChild(option);
+      });
+    });
+    if ([...select.options].some((option) => option.value === previous)) {
+      select.value = previous;
+    }
+    fillMergedDates();
+  }
+
+  function fillMergedDates() {
+    const stationSelect = $("#merged-station");
+    const dateSelect = $("#merged-date");
+    const merges = (mergeState.stations && mergeState.stations.merges) || [];
+    const group = merges.find(
+      (item) =>
+        item.current_station === stationSelect.value ||
+        item.former_stations.includes(stationSelect.value)
+    );
+    const previous = dateSelect.value;
+    dateSelect.innerHTML = "";
+    const blank = document.createElement("option");
+    blank.value = "";
+    blank.textContent = "选择日期";
+    dateSelect.appendChild(blank);
+
+    if (!group) {
+      $("#merged-load-btn").disabled = true;
+      return Promise.resolve([]);
+    }
+
+    return fetch(`/api/stations/${encodeURIComponent(group.current_station)}`)
+      .then((response) => readJson(response))
+      .then((data) => (data && data.dates) || [])
+      .catch(() => [])
+      .then((dates) => {
+        dates.forEach((day) => {
+          const option = document.createElement("option");
+          option.value = day;
+          option.textContent = day;
+          dateSelect.appendChild(option);
+        });
+        if (dates.includes(previous)) dateSelect.value = previous;
+        $("#merged-load-btn").disabled = !(stationSelect.value && dateSelect.value);
+      });
+  }
+
+  $("#refresh-stations").addEventListener("click", loadStations);
+  $("#merge-old").addEventListener("change", mergePreviewBtnState);
+  $("#merge-new").addEventListener("change", mergePreviewBtnState);
+
+  $("#merge-preview-btn").addEventListener("click", async () => {
+    const { chosen, same } = mergePreviewBtnState();
+    if (!chosen || same || mergeState.busy) return;
+    mergeState.busy = true;
+    mergePreviewBtnState();
+    $("#merge-conflict").hidden = true;
+    $("#merge-stale").hidden = true;
+    $("#merge-result").hidden = true;
+    $("#merge-preview").hidden = true;
+    const status = $("#merge-status");
+    setStatus(status, "正在归并预览…", true);
+
+    try {
+      const response = await fetch("/api/merges", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          old_station: $("#merge-old").value,
+          new_station: $("#merge-new").value,
+        }),
+      });
+      const data = await readJson(response);
+      if (response.ok) {
+        mergeState.preview = data;
+        renderMergePreview(data);
+        setStatus(status, "归并预览已生成，请核对后确认。");
+      } else if (response.status === 409 && data && data.error === "merge_conflict") {
+        mergeState.preview = data.detail;
+        renderMergeConflict(data.detail);
+        setStatus(status, "存在冲突，归并已拒绝。");
+      } else if (response.status === 409) {
+        mergeState.preview = null;
+        renderMergeConflict(null);
+        setStatus(status, (data && data.message) || "归并请求被拒绝。");
+        $("#merge-conflict-list").innerHTML = "";
+      } else {
+        mergeState.preview = null;
+        setStatus(status, (data && data.message) || "生成归并预览失败。");
+      }
+    } catch (error) {
+      setStatus(status, `生成归并预览失败：${error.message}`);
+    } finally {
+      mergeState.busy = false;
+      mergePreviewBtnState();
+    }
+  });
+
+  function renderMergeConflict(detail) {
+    const banner = $("#merge-conflict");
+    const list = $("#merge-conflict-list");
+    list.innerHTML = "";
+    banner.hidden = false;
+    if (!detail || !(detail.conflicts || []).length) {
+      if (detail !== null) {
+        const item = document.createElement("div");
+        item.className = "conflict-item";
+        item.textContent = "无法生成归并预览。";
+        list.appendChild(item);
+      }
+      return;
+    }
+    detail.conflicts.forEach((conflict) => {
+      const item = document.createElement("div");
+      item.className = "conflict-item";
+      const detailText = Object.entries(conflict.detail || {})
+        .map(([station, value]) => `${escapeHtml(station)}：<code>${escapeHtml(value)}</code>`)
+        .join("；");
+      item.innerHTML =
+        `<strong>${escapeHtml(conflict.date)} ${escapeHtml(conflict.hour)}:00 · r${conflict.revision}</strong><br>` +
+        `同一小时的最高修订号数值不一致。${detailText}`;
+      list.appendChild(item);
+    });
+  }
+
+  function renderMergePreview(preview) {
+    mergeState.preview = preview;
+    const panel = $("#merge-preview");
+    panel.hidden = false;
+    $("#merge-conflict").hidden = true;
+    $("#merge-stale").hidden = preview.status !== "stale";
+    $("#merge-result").hidden = true;
+    $("#merge-title").textContent = `${preview.old_station} → ${preview.new_station}`;
+    $("#merge-subtitle").textContent =
+      "合并后按现用编号读取；下方“来源编号”标出每条读数原本属于哪个编号。";
+
+    const meta = $("#merge-meta");
+    meta.innerHTML = "";
+    [
+      `现用编号 ${preview.current_station}`,
+      `${preview.counts.cells} 个小时`,
+      `${preview.dates.length} 个日期`,
+    ].forEach((text, index) => {
+      const chip = document.createElement("span");
+      chip.className = index === 0 ? "chip" : "chip muted";
+      chip.textContent = text;
+      meta.appendChild(chip);
+    });
+
+    const counts = $("#merge-counts");
+    counts.innerHTML = "";
+    [
+      ["old", "来自旧编号", preview.counts.from_old],
+      ["new", "来自现用编号", preview.counts.from_new],
+      ["both", "数值一致", preview.counts.from_both],
+      ["conflict", "冲突", preview.counts.conflicts],
+    ].forEach(([kind, label, value]) => {
+      const card = document.createElement("div");
+      card.className = `count-card ${kind}`;
+      card.innerHTML = `<div class="label">${label}</div><div class="value">${value}</div>`;
+      counts.appendChild(card);
+    });
+
+    const tbody = $("#merge-table tbody");
+    tbody.innerHTML = "";
+    const cells = preview.cells || [];
+    $("#merge-empty").hidden = cells.length > 0;
+    cells.forEach((cell) => {
+      const tr = document.createElement("tr");
+      tr.innerHTML = `
+        <td class="mono">${escapeHtml(cell.date)}</td>
+        <td class="mono">${escapeHtml(cell.timestamp.replace("T", " "))}</td>
+        <td class="num mono">r${cell.revision}</td>
+        <td class="num mono">${cell.value === null ? "—" : escapeHtml(cell.value)}</td>
+        <td class="reason">${escapeHtml(sourceLabel(cell))}</td>
+      `;
+      tbody.appendChild(tr);
+    });
+
+    const canConfirm =
+      preview.status === "preview" && preview.counts.conflicts === 0;
+    $("#merge-confirm-btn").disabled = mergeState.busy || !canConfirm;
+    $("#merge-confirm-btn").textContent = "确认归并";
+    setStatus($("#merge-confirm-status"), "");
+    panel.scrollIntoView({ behavior: "smooth", block: "start" });
+  }
+
+  $("#merge-confirm-btn").addEventListener("click", async () => {
+    const preview = mergeState.preview;
+    if (!preview || !preview.merge_id || mergeState.busy) return;
+    if (
+      !window.confirm(
+        `确认把 ${preview.old_station} 归并到现用编号 ${preview.new_station}？\n` +
+          `合并 ${preview.counts.cells} 个小时读数，原始已发布记录不会改动。`
+      )
+    ) {
+      return;
+    }
+    mergeState.busy = true;
+    $("#merge-confirm-btn").disabled = true;
+    const status = $("#merge-confirm-status");
+    setStatus(status, "正在原子归并…", true);
+
+    try {
+      const response = await fetch(
+        `/api/merges/${encodeURIComponent(preview.merge_id)}/confirm`,
+        { method: "POST" }
+      );
+      const data = await readJson(response);
+      if (response.ok) {
+        preview.status = "merged";
+        $("#merge-confirm-btn").disabled = true;
+        const result = (data && data.result) || {};
+        $("#merge-result").hidden = false;
+        $("#merge-result-title").textContent = data.already_merged
+          ? "该归并已确认过，本次未重复建立"
+          : "归并成功";
+        $("#merge-result-text").textContent =
+          `${result.old_station || preview.old_station} 已并入 ${result.new_station || preview.new_station}。` +
+          "原始已发布记录未改动，此后任一编号的补报都会按合并身份预览与发布。";
+        setStatus(status, "");
+        await loadStations();
+        await loadDays();
+      } else if (data && data.error === "merge_stale") {
+        preview.status = "stale";
+        $("#merge-stale").hidden = false;
+        $("#merge-confirm-btn").disabled = true;
+        setStatus(status, "归并预览已失效，请重新生成。");
+      } else if (data && data.error === "station_already_merged") {
+        $("#merge-confirm-btn").disabled = true;
+        setStatus(status, data.message || "站点编号已参与归并。");
+        await loadStations();
+      } else {
+        setStatus(status, (data && data.message) || "归并失败，已发布数据未受影响。");
+      }
+    } catch (error) {
+      setStatus(status, `归并请求失败：${error.message}，请重试。`);
+    } finally {
+      mergeState.busy = false;
+      mergePreviewBtnState();
+    }
+  });
+
+  /* ---------------- merged readings ---------------- */
+
+  $("#merged-station").addEventListener("change", fillMergedDates);
+  $("#merged-date").addEventListener("change", () => {
+    $("#merged-load-btn").disabled = !($("#merged-station").value && $("#merged-date").value);
+  });
+
+  $("#merged-load-btn").addEventListener("click", async () => {
+    const station = $("#merged-station").value;
+    const day = $("#merged-date").value;
+    if (!station || !day) return;
+    const status = $("#merged-status");
+    setStatus(status, "正在读取合并读数…", true);
+    try {
+      const response = await fetch(
+        `/api/merged/${encodeURIComponent(station)}/days/${encodeURIComponent(day)}`
+      );
+      const data = await readJson(response);
+      if (!response.ok) throw new Error((data && data.message) || "无法读取合并读数");
+      renderMergedDay(station, day, data);
+      setStatus(status, "");
+    } catch (error) {
+      setStatus(status, `读取失败：${error.message}`);
+    }
+  });
+
+  function renderMergedDay(station, day, data) {
+    const viewer = $("#merged-viewer");
+    viewer.hidden = false;
+    const canonical = data.current_station || station;
+    const tbody = $("#merged-table tbody");
+    tbody.innerHTML = "";
+    const records = data.records || [];
+    $("#merged-empty").hidden = records.length > 0;
+    records.forEach((record) => {
+      const tr = document.createElement("tr");
+      tr.innerHTML = `
+        <td class="mono">${escapeHtml(record.timestamp.replace("T", " "))}</td>
+        <td class="num mono">r${record.revision}</td>
+        <td class="num mono">${escapeHtml(record.value)}</td>
+        <td class="reason">${escapeHtml(
+          record.source_station || (record.sources || []).join("、")
+        )}</td>
+      `;
+      tbody.appendChild(tr);
+    });
+    const url = `/api/merged/${encodeURIComponent(canonical)}/days/${encodeURIComponent(day)}`;
+    $("#merged-download").hidden = false;
+    $("#merged-download").href = `${url}.json`;
+    $("#merged-download").download = `${canonical}-${day}-pm25.json`;
+    $("#merged-open").hidden = false;
+    $("#merged-open").href = `${url}.json`;
+    $("#merged-json").textContent = JSON.stringify(data, null, 2);
+    viewer.scrollIntoView({ behavior: "smooth", block: "start" });
+  }
+
   finishUploadState();
   loadDays();
+  loadStations();
 })();

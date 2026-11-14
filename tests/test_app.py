@@ -439,3 +439,413 @@ def test_two_previews_for_same_day_cannot_both_commit(client):
         ) if status == 200
     ]
     assert client.get(f"/api/previews/{applied[0]}").json()["status"] == "published"
+
+
+# ---------------------------------------------------------------------------
+# Station renumbering / merge
+# ---------------------------------------------------------------------------
+
+
+def merge(client, old: str, new: str):
+    return client.post(
+        "/api/merges", json={"old_station": old, "new_station": new}
+    )
+
+
+def confirm_merge(client, merge_id: str):
+    return client.post(f"/api/merges/{merge_id}/confirm")
+
+
+def publish_station(client, station: str, rows: list[tuple[str, int, str]]) -> None:
+    """rows = [(hour, revision, value), ...] all on 2026-11-13."""
+    body = "station,timestamp,revision,value\n" + "".join(
+        f"{station},2026-11-13T{hour}:00,{revision},{value}\n"
+        for hour, revision, value in rows
+    )
+    publish(client, body)
+
+
+def test_merge_preview_keeps_higher_revision_per_hour(client):
+    publish_station(client, "OLD-1", [("00:00", 1, "10"), ("01:00", 2, "11.5")])
+    publish_station(client, "NEW-1", [("00:00", 3, "12.5"), ("02:00", 1, "9")])
+
+    response = merge(client, "OLD-1", "NEW-1")
+    assert response.status_code == 201, response.text
+    data = response.json()
+    assert data["status"] == "preview"
+    assert data["current_station"] == "NEW-1"
+    assert data["counts"] == {
+        "cells": 3, "from_old": 1, "from_new": 2,
+        "from_both": 0, "conflicts": 0,
+    }
+    by_hour = {cell["hour"]: cell for cell in data["cells"]}
+    assert by_hour["00:00"]["value"] == "12.5"
+    assert by_hour["00:00"]["revision"] == 3
+    assert by_hour["01:00"]["value"] == "11.5"
+    assert by_hour["02:00"]["value"] == "9"
+    assert data["dates"] == ["2026-11-13"]
+
+    confirmed = confirm_merge(client, data["merge_id"])
+    assert confirmed.status_code == 200, confirmed.text
+    assert confirmed.json()["status"] == "merged"
+    assert confirmed.json()["already_merged"] is False
+
+    day = client.get("/api/merged/NEW-1/days/2026-11-13")
+    assert day.status_code == 200, day.text
+    merged = day.json()
+    assert merged["count"] == 3
+    # Two publishes (v1, v2) plus one merge invalidation (v3).
+    assert merged["day_version"] == 3
+    values = {record["hour"]: record["value"] for record in merged["records"]}
+    assert values == {"00:00": "12.5", "01:00": "11.5", "02:00": "9"}
+    # Per-hour origin is retained even though the reading is under NEW-1.
+    sources = {record["hour"]: record["sources"] for record in merged["records"]}
+    assert sources["01:00"] == ["OLD-1"]
+    assert sources["00:00"] == ["NEW-1"]
+
+    # Original published records are untouched.
+    original = client.get("/api/days/2026-11-13").json()
+    originals = {(r["station"], r["hour"]): r["value"] for r in original["records"]}
+    assert originals[("OLD-1", "01:00")] == "11.5"
+    assert originals[("NEW-1", "00:00")] == "12.5"
+
+
+def test_merge_refuses_same_revision_different_value_and_names_hours(client):
+    publish_station(client, "OLD-2", [("00:00", 4, "10"), ("03:00", 1, "8")])
+    publish_station(client, "NEW-2", [("00:00", 4, "10"), ("03:00", 2, "8.5")])
+
+    # 00:00 agrees (same revision and value); 03:00 has different revisions.
+    # Add a genuine clash at 04:00 with equal revision, different value.
+    publish_station(client, "OLD-2", [("04:00", 5, "20")])
+    publish_station(client, "NEW-2", [("04:00", 5, "21")])
+
+    response = merge(client, "OLD-2", "NEW-2")
+    assert response.status_code == 409, response.text
+    body = response.json()
+    assert body["error"] == "merge_conflict"
+    detail = body["detail"]
+    assert detail["status"] == "conflict"
+    assert detail["merge_id"] is None
+    assert detail["counts"]["conflicts"] == 1
+    conflict = detail["conflicts"][0]
+    assert conflict["hour"] == "04:00"
+    assert conflict["revision"] == 5
+    assert set(conflict["values"]) == {"20", "21"}
+    assert conflict["detail"] == {"OLD-2": "20", "NEW-2": "21"}
+
+    # Nothing was linked; each station still queries on its own.
+    assert merge(client, "OLD-2", "NEW-2").status_code == 409
+    assert client.get("/api/merged/NEW-2/days/2026-11-13").status_code == 404
+    day = client.get("/api/days/2026-11-13").json()
+    assert day["count"] == 6  # all original rows still there
+
+
+def test_merge_rejects_same_or_already_merged_station(client):
+    # Distinct hours so no same-revision conflict between the identifiers.
+    publish_station(client, "A", [("00:00", 1, "5")])
+    publish_station(client, "B", [("01:00", 1, "6")])
+    publish_station(client, "C", [("02:00", 1, "7")])
+
+    assert merge(client, "A", "A").status_code == 400
+
+    first = merge(client, "A", "B")
+    assert first.status_code == 201
+    assert confirm_merge(client, first.json()["merge_id"]).status_code == 200
+
+    again = merge(client, "A", "C")
+    assert again.status_code == 409
+    assert again.json()["error"] == "station_already_merged"
+    assert again.json()["detail"]["stations"] == ["A"]
+
+    # The current identifier is also a merged identity.
+    current = merge(client, "B", "C")
+    assert current.status_code == 409
+    assert current.json()["detail"]["stations"] == ["B"]
+
+    stations = client.get("/api/stations").json()
+    assert {item["station"] for item in stations["available"]} == {"C"}
+    assert stations["merges"][0]["current_station"] == "B"
+    assert stations["merges"][0]["former_stations"] == ["A"]
+
+
+def test_supplement_under_either_identifier_previews_and_publishes_merged(client):
+    publish_station(client, "OLD-3", [("00:00", 1, "10")])
+    publish_station(client, "NEW-3", [("01:00", 1, "11")])
+    created = merge(client, "OLD-3", "NEW-3").json()
+    assert confirm_merge(client, created["merge_id"]).status_code == 200
+
+    # A supplement still filed under the retired number is planned as NEW-3.
+    preview = upload(
+        client,
+        "station,timestamp,revision,value\n"
+        "OLD-3,2026-11-13T02:00:00,1,12\n",
+    )
+    assert preview.status_code == 201, preview.text
+    data = preview.json()
+    assert data["station_identity"] == {"OLD-3": "NEW-3"}
+    assert data["records"][0]["station"] == "NEW-3"
+    assert data["records"][0]["submitted_station"] == "OLD-3"
+    assert data["counts"]["added"] == 1
+    assert client.post(
+        f"/api/previews/{data['preview_id']}/confirm"
+    ).status_code == 200
+
+    merged = client.get("/api/merged/OLD-3/days/2026-11-13").json()
+    assert merged["count"] == 3
+    assert merged["current_station"] == "NEW-3"
+    assert merged["former_stations"] == ["OLD-3"]
+    # v1, v2 from the two publishes, v3 from the merge, v4 from the supplement.
+    assert merged["day_version"] == 4
+    # The supplement was stored under the current identity but its origin is
+    # still reported as the identifier the analyst actually submitted.
+    supplement = next(r for r in merged["records"] if r["hour"] == "02:00")
+    assert supplement["station"] == "NEW-3"
+    assert supplement["source_station"] == "OLD-3"
+
+
+def test_supplement_under_new_identifier_also_merges(client):
+    publish_station(client, "OLD-4", [("00:00", 1, "10")])
+    publish_station(client, "NEW-4", [("01:00", 1, "11")])
+    confirmed = merge(client, "OLD-4", "NEW-4").json()
+    assert confirm_merge(client, confirmed["merge_id"]).status_code == 200
+
+    preview = upload(
+        client,
+        "station,timestamp,revision,value\n"
+        "NEW-4,2026-11-13T01:00:00,2,11.5\n",
+    ).json()
+    assert preview["records"][0]["action"] == "replace"
+    assert client.post(
+        f"/api/previews/{preview['preview_id']}/confirm"
+    ).status_code == 200
+
+    merged = client.get("/api/merged/NEW-4/days/2026-11-13").json()
+    assert merged["count"] == 2
+    values = {r["hour"]: r["value"] for r in merged["records"]}
+    assert values == {"00:00": "10", "01:00": "11.5"}
+
+
+def test_preview_built_before_merge_cannot_publish_after_it(client):
+    publish_station(client, "OLD-11", [("00:00", 1, "10")])
+    publish_station(client, "NEW-11", [("01:00", 1, "11")])
+
+    pending = upload(
+        client,
+        "station,timestamp,revision,value\n"
+        "OLD-11,2026-11-13T02:00:00,1,12\n",
+    ).json()
+    merge_preview = merge(client, "OLD-11", "NEW-11").json()
+    assert confirm_merge(client, merge_preview["merge_id"]).status_code == 200
+
+    assert client.post(
+        f"/api/previews/{pending['preview_id']}/confirm"
+    ).status_code == 409
+    merged = client.get("/api/merged/NEW-11/days/2026-11-13").json()
+    # The pre-merge supplement never landed in the merged projection.
+    assert [r["hour"] for r in merged["records"]] == ["00:00", "01:00"]
+
+    # Re-previewing now plans the supplement against the merged identity.
+    retry = upload(
+        client,
+        "station,timestamp,revision,value\n"
+        "OLD-11,2026-11-13T02:00:00,1,12\n",
+    ).json()
+    assert retry["station_identity"] == {"OLD-11": "NEW-11"}
+    assert client.post(
+        f"/api/previews/{retry['preview_id']}/confirm"
+    ).status_code == 200
+    merged = client.get("/api/merged/NEW-11/days/2026-11-13").json()
+    assert [r["hour"] for r in merged["records"]] == ["00:00", "01:00", "02:00"]
+
+
+def test_merge_invalidates_open_previews_of_affected_dates(client):
+    publish_station(client, "OLD-5", [("00:00", 1, "10")])
+    publish_station(client, "NEW-5", [("01:00", 1, "11")])
+
+    pending = upload(
+        client,
+        "station,timestamp,revision,value\n"
+        "OLD-5,2026-11-13T05:00:00,1,15\n",
+    ).json()
+    pending_id = pending["preview_id"]
+    assert pending["status"] == "preview"
+
+    merge_preview = merge(client, "OLD-5", "NEW-5").json()
+    assert confirm_merge(client, merge_preview["merge_id"]).status_code == 200
+
+    stale = client.post(f"/api/previews/{pending_id}/confirm")
+    assert stale.status_code == 409
+    assert stale.json()["error"] == "preview_stale"
+    assert client.get(f"/api/previews/{pending_id}").json()["status"] == "stale"
+
+    merged = client.get("/api/merged/NEW-5/days/2026-11-13").json()
+    assert [r["hour"] for r in merged["records"]] == ["00:00", "01:00"]
+
+
+def test_merge_invalidated_by_supplement_published_after_preview(client):
+    publish_station(client, "OLD-6", [("00:00", 1, "10")])
+    publish_station(client, "NEW-6", [("01:00", 1, "11")])
+
+    merge_preview = merge(client, "OLD-6", "NEW-6").json()
+    merge_id = merge_preview["merge_id"]
+
+    supplement = upload(
+        client,
+        "station,timestamp,revision,value\n"
+        "NEW-6,2026-11-13T01:00:00,2,11.5\n",
+    ).json()
+    assert client.post(
+        f"/api/previews/{supplement['preview_id']}/confirm"
+    ).status_code == 200
+
+    stale = confirm_merge(client, merge_id)
+    assert stale.status_code == 409
+    assert stale.json()["error"] == "merge_stale"
+    assert client.get(f"/api/merges/{merge_id}").json()["status"] == "stale"
+
+    # Re-previewing after the supplement gives the merged projection.
+    fresh = merge(client, "OLD-6", "NEW-6").json()
+    assert confirm_merge(client, fresh["merge_id"]).status_code == 200
+    merged = client.get("/api/merged/NEW-6/days/2026-11-13").json()
+    values = {r["hour"]: r["value"] for r in merged["records"]}
+    assert values == {"00:00": "10", "01:00": "11.5"}
+
+
+def test_repeated_merge_confirm_is_idempotent(client):
+    publish_station(client, "OLD-7", [("00:00", 1, "10")])
+    publish_station(client, "NEW-7", [("01:00", 1, "11")])
+    merge_id = merge(client, "OLD-7", "NEW-7").json()["merge_id"]
+
+    first = confirm_merge(client, merge_id)
+    assert first.status_code == 200
+    assert first.json()["already_merged"] is False
+    second = confirm_merge(client, merge_id)
+    assert second.status_code == 200
+    assert second.json()["already_merged"] is True
+    assert second.json()["result"] == first.json()["result"]
+
+    # The merge advanced each affected date exactly once.
+    merged = client.get("/api/merged/NEW-7/days/2026-11-13").json()
+    assert merged["day_version"] == 3
+    assert len(client.get("/api/stations").json()["merges"]) == 1
+
+
+def test_merge_requires_both_identifiers_to_have_records(client):
+    publish_station(client, "ONLY", [("00:00", 1, "10")])
+    response = merge(client, "ONLY", "MISSING")
+    assert response.status_code == 400
+    assert "MISSING" in response.json()["message"]
+
+
+def test_supplement_after_merge_competes_by_revision_with_old_rows(client):
+    publish_station(client, "OLD-12", [("00:00", 5, "10")])
+    publish_station(client, "NEW-12", [("01:00", 1, "11")])
+    confirmed = merge(client, "OLD-12", "NEW-12").json()
+    assert confirm_merge(client, confirmed["merge_id"]).status_code == 200
+
+    # A lower supplement under the retired number is ignored, not applied.
+    low = upload(
+        client,
+        "station,timestamp,revision,value\n"
+        "OLD-12,2026-11-13T00:00:00,4,9.5\n",
+    ).json()
+    assert low["records"][0]["action"] == "ignore"
+    assert low["records"][0]["reason"] == "older_than_published"
+    assert low["counts"]["pending"] == 0
+
+    # A higher supplement replaces the merged reading.
+    high = upload(
+        client,
+        "station,timestamp,revision,value\n"
+        "OLD-12,2026-11-13T00:00:00,6,10.5\n",
+    ).json()
+    assert high["records"][0]["action"] == "replace"
+    assert client.post(
+        f"/api/previews/{high['preview_id']}/confirm"
+    ).status_code == 200
+
+    merged = client.get("/api/merged/NEW-12/days/2026-11-13").json()
+    by_hour = {r["hour"]: r for r in merged["records"]}
+    assert by_hour["00:00"]["value"] == "10.5"
+    assert by_hour["00:00"]["revision"] == 6
+    assert by_hour["00:00"]["source_station"] == "OLD-12"
+
+
+def test_concurrent_merges_on_overlapping_stations_serialise(client):
+    from concurrent.futures import ThreadPoolExecutor
+
+    for name in ("S-A", "S-B", "S-C"):
+        publish_station(client, name, [("00:00", 1, "10")])
+
+    first = merge(client, "S-A", "S-B")
+    second = merge(client, "S-B", "S-C")
+    assert first.status_code == 201 and second.status_code == 201
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        statuses = list(
+            pool.map(
+                confirm_merge,
+                [client, client],
+                [first.json()["merge_id"], second.json()["merge_id"]],
+            )
+        )
+    codes = sorted(response.status_code for response in statuses)
+    assert codes == [200, 409], [r.text for r in statuses]
+
+    merges = client.get("/api/stations").json()["merges"]
+    assert len(merges) == 1
+    current = merges[0]["current_station"]
+    former = merges[0]["former_stations"]
+    # Exactly one of the overlapping pairs won, and it is fully linked.
+    assert sorted({current, *former}) in (["S-A", "S-B"], ["S-B", "S-C"])
+
+
+def test_concurrent_confirms_of_same_merge_give_one_identity(client):
+    from concurrent.futures import ThreadPoolExecutor
+
+    publish_station(client, "OLD-8", [("00:00", 1, "10")])
+    publish_station(client, "NEW-8", [("01:00", 1, "11")])
+    merge_id = merge(client, "OLD-8", "NEW-8").json()["merge_id"]
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        responses = list(
+            pool.map(lambda _: confirm_merge(client, merge_id), range(4))
+        )
+    assert all(response.status_code == 200 for response in responses)
+    created = [r.json() for r in responses if r.json()["already_merged"] is False]
+    assert len(created) == 1
+    assert all(r.json()["result"] == created[0]["result"] for r in responses)
+
+    merged = client.get("/api/merged/NEW-8/days/2026-11-13").json()
+    assert merged["day_version"] == 3
+
+
+def test_merged_day_unknown_or_unmerged_station(client):
+    assert client.get("/api/merged/OLD-9/days/2026-11-13").status_code == 404
+    assert client.get("/api/merged/OLD-9/days/2026-13-01").status_code == 400
+
+
+def test_merged_day_mapping_and_readings_share_one_snapshot(client):
+    publish_station(client, "OLD-10", [("00:00", 1, "10")])
+    publish_station(client, "NEW-10", [("01:00", 1, "11")])
+    merge_id = merge(client, "OLD-10", "NEW-10").json()["merge_id"]
+    assert confirm_merge(client, merge_id).status_code == 200
+
+    # Any identifier converges on the same current identity and readings.
+    for station in ("OLD-10", "NEW-10"):
+        response = client.get(f"/api/merged/{station}/days/2026-11-13")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["current_station"] == "NEW-10"
+        assert [r["hour"] for r in data["records"]] == ["00:00", "01:00"]
+
+    station_view = client.get("/api/stations/OLD-10").json()
+    assert station_view["canonical_station"] == "NEW-10"
+    assert station_view["stations"] == ["NEW-10", "OLD-10"]
+    assert {(r["station"], r["hour"]) for r in station_view["records"]} == {
+        ("OLD-10", "00:00"), ("NEW-10", "01:00"),
+    }
+
+    download = client.get("/api/merged/NEW-10/days/2026-11-13.json")
+    assert download.status_code == 200
+    assert "attachment" in download.headers["content-disposition"]
